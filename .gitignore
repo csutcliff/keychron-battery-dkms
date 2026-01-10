@@ -1,0 +1,21 @@
+# Build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.order
+*.symvers
+.tmp_versions/
+modules.order
+Module.symvers
+
+# Package build
+pkg/
+src/
+*.pkg.tar*
+*.log
+
+# Editor
+*~
+*.swp
+.vscode/
