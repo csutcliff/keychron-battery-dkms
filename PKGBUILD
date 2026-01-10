@@ -13,17 +13,13 @@ optdepends=('linux-headers: build the module against the Arch stock kernel'
             'linux-cachyos-headers: build the module against the CachyOS kernel')
 provides=('keychron-battery')
 conflicts=('keychron-battery')
-_giturl="https://raw.githubusercontent.com/csutcliff/keychron-battery-dkms/v${pkgver}"
-source=("${_giturl}/keychron_battery.c"
-        "${_giturl}/Makefile"
-        "${_giturl}/dkms.conf")
-sha256sums=('d1812e7d567c611bc339ae69a9830f91d8142e87c7faffd7b6bc9eb54bd0fa77'
-            'bf1ea239f3983ce1aaa076c74ca88c50bbc4596e4e15c9082453c0c632852544'
-            'b1fc4f96e7f17155e3b3e87b2d7d103d84d78ab4468a797ec96fb3d3f7ac7d5c')
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('e2e69938b69a031c7d684a0f84373339f726d2d60b6aff180a6c387a8f992fde')
 
 package() {
     local install_dir="${pkgdir}/usr/src/${pkgname%-dkms}-${pkgver}"
 
+    cd "${srcdir}/${pkgname}-${pkgver}"
     install -Dm644 keychron_battery.c "${install_dir}/keychron_battery.c"
     install -Dm644 Makefile "${install_dir}/Makefile"
     install -Dm644 dkms.conf "${install_dir}/dkms.conf"
