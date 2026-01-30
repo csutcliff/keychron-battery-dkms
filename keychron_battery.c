@@ -311,7 +311,16 @@ static int keychron_probe(struct hid_device *hdev,
 	if (ret)
 		return ret;
 
-	ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
+	/*
+	 * Start standard interfaces with full connectivity (keyboard, mouse
+	 * input devices etc). The vendor interface only needs hidraw — creating
+	 * input devices from its HID descriptor exposes keyboard capabilities
+	 * that cause UPower to misclassify the battery as a keyboard.
+	 */
+	if (keychron_is_vendor_interface(hdev))
+		ret = hid_hw_start(hdev, HID_CONNECT_HIDRAW);
+	else
+		ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
 	if (ret)
 		return ret;
 
