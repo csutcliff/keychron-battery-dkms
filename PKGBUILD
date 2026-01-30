@@ -14,7 +14,7 @@ optdepends=('linux-headers: build the module against the Arch stock kernel'
 provides=('keychron-battery')
 conflicts=('keychron-battery')
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
-sha256sums=('78e819a6e33a6b1cff4ed268a2f2c53b41ad5e922c2d15b7be0c127871d33e2a')
+sha256sums=('172b0d0363a118f8d6a2e745f5b293c551df80de952365a8ce0028ed6e9cda0b')
 
 package() {
     local install_dir="${pkgdir}/usr/src/${pkgname%-dkms}-${pkgver}"
