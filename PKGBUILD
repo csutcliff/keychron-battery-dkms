@@ -1,6 +1,6 @@
 # Maintainer: Chris Sutcliff <chris@sutcliff.me>
 pkgname=keychron-battery-dkms
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="HID driver for Keychron mouse battery reporting via power_supply subsystem"
 arch=('x86_64')
