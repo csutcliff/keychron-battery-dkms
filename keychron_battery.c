@@ -12,6 +12,8 @@
  * Supported devices:
  *   - Keychron M5 (wired mode): 3434:d048
  *   - Keychron M5 (wireless via Ultra-Link 8K receiver): 3434:d028
+ *   - Keychron M6 (wired mode): 3434:d049
+ *   - Keychron M6 (wireless via Ultra-Link 8K receiver): 3434:d028
  */
 
 #include <linux/module.h>
@@ -24,6 +26,7 @@
 
 #define USB_VENDOR_ID_KEYCHRON		0x3434
 #define USB_DEVICE_ID_KEYCHRON_M5	0xd048
+#define USB_DEVICE_ID_KEYCHRON_M6	0xd049
 #define USB_DEVICE_ID_KEYCHRON_RECV	0xd028
 
 #define KEYCHRON_REPORT_ID_CMD		0xB3
@@ -140,8 +143,12 @@ static void keychron_urb_complete(struct urb *urb)
 static int keychron_query_battery_once(struct keychron_device *kdev, u8 *buf)
 {
 	int ret;
-	int intf_num;
 	unsigned long timeout;
+
+	/* Prepare command buffer */
+	memset(buf, 0, KEYCHRON_REPORT_SIZE);
+	buf[0] = KEYCHRON_REPORT_ID_CMD;
+	buf[1] = KEYCHRON_CMD_STATUS;
 
 	/* Prepare for interrupt response */
 	reinit_completion(&kdev->response_received);
@@ -159,21 +166,8 @@ static int keychron_query_battery_once(struct keychron_device *kdev, u8 *buf)
 	if (ret < 0)
 		goto out;
 
-	/* Send status request via control endpoint (SET_REPORT feature) */
-	memset(buf, 0, KEYCHRON_REPORT_SIZE);
-	buf[0] = KEYCHRON_REPORT_ID_CMD;
-	buf[1] = KEYCHRON_CMD_STATUS;
-
-	intf_num = kdev->intf->cur_altsetting->desc.bInterfaceNumber;
-
-	ret = usb_control_msg(kdev->udev,
-			      usb_sndctrlpipe(kdev->udev, 0),
-			      HID_REQ_SET_REPORT,
-			      USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-			      (HID_FEATURE_REPORT << 8) | KEYCHRON_REPORT_ID_CMD,
-			      intf_num,
-			      buf, KEYCHRON_REPORT_SIZE,
-			      KEYCHRON_USB_TIMEOUT_MS);
+	/* Send command via interrupt OUT endpoint (same as hidraw write) */
+	ret = hid_hw_output_report(kdev->hdev, buf, KEYCHRON_REPORT_SIZE);
 	if (ret < 0) {
 		usb_kill_urb(kdev->intr_urb);
 		goto out;
@@ -458,6 +452,7 @@ static void keychron_remove(struct hid_device *hdev)
 
 static const struct hid_device_id keychron_devices[] = {
 	{ HID_USB_DEVICE(USB_VENDOR_ID_KEYCHRON, USB_DEVICE_ID_KEYCHRON_M5) },
+	{ HID_USB_DEVICE(USB_VENDOR_ID_KEYCHRON, USB_DEVICE_ID_KEYCHRON_M6) },
 	{ HID_USB_DEVICE(USB_VENDOR_ID_KEYCHRON, USB_DEVICE_ID_KEYCHRON_RECV) },
 	{ }
 };
