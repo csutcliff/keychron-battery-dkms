@@ -11,7 +11,7 @@ Keychron mice don't expose battery level via standard HID battery reports. This 
 | Device | USB ID | Mode |
 |--------|--------|------|
 | Keychron M5 | `3434:d048` | Wired |
-| Keychron M6 | `3434:d049` | Wired |
+| Keychron M6 8K | `3434:d049` | Wired |
 | Keychron Ultra-Link 8K | `3434:d028` | Wireless receiver |
 
 Other Keychron mice using the same protocol may also work.
