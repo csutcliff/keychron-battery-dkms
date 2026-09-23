@@ -498,7 +498,7 @@ static int keychron_probe(struct hid_device *hdev,
 {
 	struct keychron_device *kdev;
 	struct usb_interface *intf;
-	int battery, ret;
+	int ret;
 
 	kdev = devm_kzalloc(&hdev->dev, sizeof(*kdev), GFP_KERNEL);
 	if (!kdev)
@@ -570,32 +570,18 @@ static int keychron_probe(struct hid_device *hdev,
 	INIT_DELAYED_WORK(&kdev->work, keychron_work);
 
 	/*
-	 * Try an initial query so the battery shows up immediately when the
-	 * mouse is awake. A failure here is expected for a sleeping wireless
-	 * mouse and must NOT abort: the poll worker keeps retrying and
-	 * registers the power supply on the first successful reading.
+	 * Try an initial query to see if the mouse is awake. A failure here is
+	 * expected for a sleeping wireless mouse and must NOT abort: the poll
+	 * worker keeps retrying.
 	 */
 	ret = keychron_detect_model(kdev);
-	if (ret)
-		battery = ret;
-	else
-		battery = keychron_query_battery_status(kdev);
-
-	if (battery >= 0) {
-		keychron_update_battery(kdev, battery);
-		ret = keychron_register_battery(kdev);
-		if (ret)
-			goto err_cleanup;
-		hid_info(hdev, "%s battery: %d%%%s\n", kdev->model_name,
-			 kdev->battery_capacity,
-			 kdev->battery_charging ? " (charging)" : "");
-		schedule_delayed_work(&kdev->work,
-				      msecs_to_jiffies(KEYCHRON_POLL_INTERVAL_MS));
-	} else {
+	if (ret) {
 		hid_info(hdev, "initial query failed (%d), mouse likely asleep; will keep polling\n",
-			 battery);
+			 ret);
 		schedule_delayed_work(&kdev->work,
 				      msecs_to_jiffies(KEYCHRON_RETRY_POLL_MS));
+	} else {
+		schedule_delayed_work(&kdev->work, 0);
 	}
 
 	return 0;
