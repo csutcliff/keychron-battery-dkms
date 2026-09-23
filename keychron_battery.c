@@ -38,6 +38,8 @@
 #define KEYCHRON_REPORT_ID_RESP		0xB4
 #define KEYCHRON_CMD_STATUS		0x06
 #define KEYCHRON_BATTERY_OFFSET		20
+#define KEYCHRON_BATTERY_CHARGING	BIT(7)
+#define KEYCHRON_BATTERY_LEVEL		GENMASK(6, 0)
 #define KEYCHRON_VENDOR_INTERFACE	4
 
 #define KEYCHRON_REPORT_ID_INFO		0xB5
@@ -75,6 +77,7 @@ struct keychron_device {
 	int intr_ep;
 	int intr_interval;
 	int battery_capacity;
+	bool battery_charging;
 	u8 expected_cmd;
 	u8 expected_resp_id;
 	u8 resp[KEYCHRON_REPORT_SIZE];
@@ -113,7 +116,12 @@ static int keychron_battery_get_property(struct power_supply *psy,
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
-		val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
+		if (!kdev->battery_charging)
+			val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
+		else if (kdev->battery_capacity == 100)
+			val->intval = POWER_SUPPLY_STATUS_FULL;
+		else
+			val->intval = POWER_SUPPLY_STATUS_CHARGING;
 		break;
 	case POWER_SUPPLY_PROP_PRESENT:
 		val->intval = 1;
@@ -265,7 +273,7 @@ static int keychron_query(struct keychron_device *kdev, u8 report_id, u8 cmd,
 	return ret;
 }
 
-static int keychron_query_battery(struct keychron_device *kdev)
+static int keychron_query_battery_status(struct keychron_device *kdev)
 {
 	int ret;
 
@@ -275,10 +283,23 @@ static int keychron_query_battery(struct keychron_device *kdev)
 		return ret;
 
 	if (ret < KEYCHRON_BATTERY_OFFSET + 1 ||
-	    kdev->resp[KEYCHRON_BATTERY_OFFSET] > 100)
+	    (kdev->resp[KEYCHRON_BATTERY_OFFSET] & KEYCHRON_BATTERY_LEVEL) > 100)
 		return -EPROTO;
 
 	return kdev->resp[KEYCHRON_BATTERY_OFFSET];
+}
+
+static bool keychron_update_battery(struct keychron_device *kdev, int battery)
+{
+	int capacity = battery & KEYCHRON_BATTERY_LEVEL;
+	bool charging = !!(battery & KEYCHRON_BATTERY_CHARGING);
+	bool changed = capacity != kdev->battery_capacity ||
+		       charging != kdev->battery_charging;
+
+	kdev->battery_capacity = capacity;
+	kdev->battery_charging = charging;
+
+	return changed;
 }
 
 static int keychron_query_paired_product(struct keychron_device *kdev,
@@ -387,13 +408,13 @@ static void keychron_work(struct work_struct *work)
 {
 	struct keychron_device *kdev = container_of(work, struct keychron_device,
 						    work.work);
-	int ret, battery;
+	int ret, battery_status;
 
 	ret = keychron_detect_model(kdev);
 	if (ret)
-		battery = ret;
+		battery_status = ret;
 	else
-		battery = keychron_query_battery(kdev);
+		battery_status = keychron_query_battery_status(kdev);
 
 	/*
 	 * The mouse is wireless and frequently asleep (notably at boot), so a
@@ -401,7 +422,7 @@ static void keychron_work(struct work_struct *work)
 	 * interval until it responds rather than giving up — otherwise a single
 	 * miss leaves the battery unreported for the whole session.
 	 */
-	if (battery < 0) {
+	if (battery_status < 0) {
 		schedule_delayed_work(&kdev->work,
 				      msecs_to_jiffies(KEYCHRON_RETRY_POLL_MS));
 		return;
@@ -409,18 +430,19 @@ static void keychron_work(struct work_struct *work)
 
 	/* First successful reading: register the power supply now. */
 	if (!kdev->battery) {
+		keychron_update_battery(kdev, battery_status);
 		if (keychron_register_battery(kdev)) {
 			schedule_delayed_work(&kdev->work,
 					      msecs_to_jiffies(KEYCHRON_RETRY_POLL_MS));
 			return;
 		}
-		kdev->battery_capacity = battery;
-		hid_info(kdev->hdev, "%s battery: %d%%\n", kdev->model_name,
-			 battery);
-	} else if (battery != kdev->battery_capacity) {
-		kdev->battery_capacity = battery;
+		hid_info(kdev->hdev, "%s battery: %d%%%s\n", kdev->model_name,
+			 kdev->battery_capacity,
+			 kdev->battery_charging ? " (charging)" : "");
+	} else if (keychron_update_battery(kdev, battery_status)) {
 		power_supply_changed(kdev->battery);
-		hid_dbg(kdev->hdev, "battery: %d%%\n", battery);
+		hid_dbg(kdev->hdev, "battery: %d%%%s\n", kdev->battery_capacity,
+			kdev->battery_charging ? " (charging)" : "");
 	}
 
 	schedule_delayed_work(&kdev->work,
@@ -557,14 +579,16 @@ static int keychron_probe(struct hid_device *hdev,
 	if (ret)
 		battery = ret;
 	else
-		battery = keychron_query_battery(kdev);
+		battery = keychron_query_battery_status(kdev);
 
 	if (battery >= 0) {
+		keychron_update_battery(kdev, battery);
 		ret = keychron_register_battery(kdev);
 		if (ret)
 			goto err_cleanup;
-		kdev->battery_capacity = battery;
-		hid_info(hdev, "%s battery: %d%%\n", kdev->model_name, battery);
+		hid_info(hdev, "%s battery: %d%%%s\n", kdev->model_name,
+			 kdev->battery_capacity,
+			 kdev->battery_charging ? " (charging)" : "");
 		schedule_delayed_work(&kdev->work,
 				      msecs_to_jiffies(KEYCHRON_POLL_INTERVAL_MS));
 	} else {
