@@ -12,7 +12,7 @@ Keychron mice don't expose battery level via standard HID battery reports. This 
 |--------|--------|------|
 | Keychron M5 | `3434:d048` | Wired |
 | Keychron M6 8K | `3434:d049` | Wired |
-| Keychron Ultra-Link 8K | `3434:d028` | Wireless receiver |
+| Keychron Ultra-Link 8K | `3434:d028` | Wireless receiver (M5, M6 8K) |
 
 Other Keychron mice using the same protocol may also work.
 
@@ -61,10 +61,13 @@ Desktop environments with battery widgets (KDE, GNOME, etc.) will automatically 
 ## How It Works
 
 1. Module binds to Keychron USB devices on interface 4 (vendor-specific HID)
-2. Sends status request (report ID `0xB3`, command `0x06`) via USB control endpoint
+2. Sends status request (report ID `0xB3`, command `0x06`) as an HID output report
 3. Receives battery response (report ID `0xB4`) via USB interrupt endpoint
-4. Polls every 5 minutes to update battery level
-5. Exposes battery via power_supply subsystem → UPower → desktop widget
+4. Detects the model: in wired mode from the USB product ID; via the receiver
+   (which uses `3434:d028` for every mouse) by sending report ID `0xB5`,
+   command `0x03`, which returns the VID/PID of the paired mouse
+5. Polls every 5 minutes to update battery level
+6. Exposes battery via power_supply subsystem → UPower → desktop widget
 
 ## Troubleshooting
 
