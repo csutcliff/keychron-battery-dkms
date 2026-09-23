@@ -12,6 +12,12 @@
  * Supported devices:
  *   - Keychron M5 (wired mode): 3434:d048
  *   - Keychron M5 (wireless via Ultra-Link 8K receiver): 3434:d028
+ *   - Keychron M6 (wired mode): 3434:d049
+ *   - Keychron M6 (wireless via Ultra-Link 8K receiver): 3434:d028
+ *
+ * The receiver has the same USB ID for every mouse, so when connected
+ * through it the model is found by asking the receiver for the VID/PID of
+ * the paired mouse. This is what Keychron's web launcher does too.
  */
 
 #include <linux/module.h>
@@ -21,16 +27,27 @@
 #include <linux/workqueue.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
+#include <linux/unaligned.h>
 
 #define USB_VENDOR_ID_KEYCHRON		0x3434
 #define USB_DEVICE_ID_KEYCHRON_M5	0xd048
+#define USB_DEVICE_ID_KEYCHRON_M6	0xd049
 #define USB_DEVICE_ID_KEYCHRON_RECV	0xd028
 
 #define KEYCHRON_REPORT_ID_CMD		0xB3
 #define KEYCHRON_REPORT_ID_RESP		0xB4
 #define KEYCHRON_CMD_STATUS		0x06
 #define KEYCHRON_BATTERY_OFFSET		20
+#define KEYCHRON_BATTERY_CHARGING	BIT(7)
+#define KEYCHRON_BATTERY_LEVEL		GENMASK(6, 0)
 #define KEYCHRON_VENDOR_INTERFACE	4
+
+#define KEYCHRON_REPORT_ID_INFO		0xB5
+#define KEYCHRON_CMD_RECV_STATE		0x03
+#define KEYCHRON_INFO_REPORT_SIZE	21
+#define KEYCHRON_RECV_SLOT_OFFSET	3
+#define KEYCHRON_RECV_SLOT_SIZE		5
+#define KEYCHRON_RECV_SLOTS		3
 
 #define KEYCHRON_POLL_INTERVAL_MS	300000	/* 5 minutes */
 #define KEYCHRON_RETRY_POLL_MS		60000	/* 1 minute, while mouse not yet responding */
@@ -53,17 +70,33 @@ struct keychron_device {
 	struct usb_interface *intf;
 	struct power_supply *battery;
 	struct power_supply_desc battery_desc;
-	struct delayed_work battery_work;
+	struct delayed_work work;
 	struct urb *intr_urb;
 	struct completion response_received;
 	u8 *intr_buf;
 	int intr_ep;
 	int intr_interval;
 	int battery_capacity;
-	int pending_battery;
+	bool battery_charging;
+	u8 expected_cmd;
+	u8 expected_resp_id;
+	u8 resp[KEYCHRON_REPORT_SIZE];
+	int resp_len;
+	const char *model_name;
 	bool owns_battery;
 	atomic_t waiting_response;
 };
+
+/* driver_data holds the model name, NULL where it must be queried */
+static const struct hid_device_id keychron_devices[] = {
+	{ HID_USB_DEVICE(USB_VENDOR_ID_KEYCHRON, USB_DEVICE_ID_KEYCHRON_M5),
+	  .driver_data = (kernel_ulong_t)"Keychron M5" },
+	{ HID_USB_DEVICE(USB_VENDOR_ID_KEYCHRON, USB_DEVICE_ID_KEYCHRON_M6),
+	  .driver_data = (kernel_ulong_t)"Keychron M6 8K" },
+	{ HID_USB_DEVICE(USB_VENDOR_ID_KEYCHRON, USB_DEVICE_ID_KEYCHRON_RECV) },
+	{ }
+};
+MODULE_DEVICE_TABLE(hid, keychron_devices);
 
 static enum power_supply_property keychron_battery_props[] = {
 	POWER_SUPPLY_PROP_STATUS,
@@ -83,7 +116,12 @@ static int keychron_battery_get_property(struct power_supply *psy,
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
-		val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
+		if (!kdev->battery_charging)
+			val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
+		else if (kdev->battery_capacity == 100)
+			val->intval = POWER_SUPPLY_STATUS_FULL;
+		else
+			val->intval = POWER_SUPPLY_STATUS_CHARGING;
 		break;
 	case POWER_SUPPLY_PROP_PRESENT:
 		val->intval = 1;
@@ -105,7 +143,7 @@ static int keychron_battery_get_property(struct power_supply *psy,
 		val->intval = POWER_SUPPLY_SCOPE_DEVICE;
 		break;
 	case POWER_SUPPLY_PROP_MODEL_NAME:
-		val->strval = "Keychron M5";
+		val->strval = kdev->model_name;
 		break;
 	case POWER_SUPPLY_PROP_MANUFACTURER:
 		val->strval = "Keychron";
@@ -120,6 +158,7 @@ static void keychron_urb_complete(struct urb *urb)
 {
 	struct keychron_device *kdev = urb->context;
 	u8 *data = kdev->intr_buf;
+	int ret;
 
 	if (urb->status)
 		return;
@@ -127,25 +166,43 @@ static void keychron_urb_complete(struct urb *urb)
 	if (!atomic_read(&kdev->waiting_response))
 		return;
 
-	/* Validate response: report ID 0xB4, command echo 0x06, valid length */
-	if (urb->actual_length >= KEYCHRON_BATTERY_OFFSET + 1 &&
-	    data[0] == KEYCHRON_REPORT_ID_RESP &&
-	    data[1] == KEYCHRON_CMD_STATUS &&
-	    data[KEYCHRON_BATTERY_OFFSET] <= 100) {
-		kdev->pending_battery = data[KEYCHRON_BATTERY_OFFSET];
-		complete(&kdev->response_received);
+	/* Validate response: command echo and, if known, the report ID */
+	if (urb->actual_length < 2 || data[1] != kdev->expected_cmd ||
+	    (kdev->expected_resp_id && data[0] != kdev->expected_resp_id)) {
+		hid_dbg(kdev->hdev,
+			"skipping report (expected: cmd=0x%02x, resp_id=0x%02x): %*ph\n",
+			kdev->expected_cmd, kdev->expected_resp_id,
+			urb->actual_length, data);
+
+		ret = usb_submit_urb(urb, GFP_ATOMIC);
+		if (ret)
+			hid_dbg(kdev->hdev, "failed to re-submit URB: %d\n",
+				ret);
+
+		return;
 	}
+
+	kdev->resp_len = urb->actual_length;
+	memcpy(kdev->resp, data, urb->actual_length);
+	complete(&kdev->response_received);
 }
 
-static int keychron_query_battery_once(struct keychron_device *kdev, u8 *buf)
+static int keychron_query_once(struct keychron_device *kdev, u8 *buf,
+			       u8 report_id, u8 cmd, u8 resp_id, size_t len)
 {
 	int ret;
-	int intf_num;
 	unsigned long timeout;
+
+	/* Prepare command buffer */
+	memset(buf, 0, len);
+	buf[0] = report_id;
+	buf[1] = cmd;
 
 	/* Prepare for interrupt response */
 	reinit_completion(&kdev->response_received);
-	kdev->pending_battery = -1;
+	kdev->expected_cmd = cmd;
+	kdev->expected_resp_id = resp_id;
+	kdev->resp_len = 0;
 	atomic_set(&kdev->waiting_response, 1);
 
 	/* Submit URB to receive interrupt response */
@@ -159,21 +216,8 @@ static int keychron_query_battery_once(struct keychron_device *kdev, u8 *buf)
 	if (ret < 0)
 		goto out;
 
-	/* Send status request via control endpoint (SET_REPORT feature) */
-	memset(buf, 0, KEYCHRON_REPORT_SIZE);
-	buf[0] = KEYCHRON_REPORT_ID_CMD;
-	buf[1] = KEYCHRON_CMD_STATUS;
-
-	intf_num = kdev->intf->cur_altsetting->desc.bInterfaceNumber;
-
-	ret = usb_control_msg(kdev->udev,
-			      usb_sndctrlpipe(kdev->udev, 0),
-			      HID_REQ_SET_REPORT,
-			      USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-			      (HID_FEATURE_REPORT << 8) | KEYCHRON_REPORT_ID_CMD,
-			      intf_num,
-			      buf, KEYCHRON_REPORT_SIZE,
-			      KEYCHRON_USB_TIMEOUT_MS);
+	ret = hid_hw_raw_request(kdev->hdev, report_id, buf, len,
+				 HID_OUTPUT_REPORT, HID_REQ_SET_REPORT);
 	if (ret < 0) {
 		usb_kill_urb(kdev->intr_urb);
 		goto out;
@@ -185,8 +229,8 @@ static int keychron_query_battery_once(struct keychron_device *kdev, u8 *buf)
 
 	usb_kill_urb(kdev->intr_urb);
 
-	if (timeout && kdev->pending_battery >= 0)
-		return kdev->pending_battery;
+	if (timeout && kdev->resp_len)
+		return kdev->resp_len;
 
 	return -ETIMEDOUT;
 
@@ -195,7 +239,8 @@ out:
 	return ret;
 }
 
-static int keychron_query_battery(struct keychron_device *kdev)
+static int keychron_query(struct keychron_device *kdev, u8 report_id, u8 cmd,
+			  u8 resp_id, size_t len)
 {
 	u8 *buf;
 	int ret;
@@ -204,7 +249,7 @@ static int keychron_query_battery(struct keychron_device *kdev)
 	if (!kdev->udev || !kdev->intr_urb)
 		return -ENODEV;
 
-	buf = kmalloc(KEYCHRON_REPORT_SIZE, GFP_KERNEL);
+	buf = kmalloc(len, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
 
@@ -212,7 +257,8 @@ static int keychron_query_battery(struct keychron_device *kdev)
 		if (attempt > 0)
 			msleep(KEYCHRON_RETRY_DELAY_MS);
 
-		ret = keychron_query_battery_once(kdev, buf);
+		ret = keychron_query_once(kdev, buf, report_id, cmd, resp_id,
+					  len);
 		atomic_set(&kdev->waiting_response, 0);
 
 		if (ret >= 0)
@@ -220,11 +266,117 @@ static int keychron_query_battery(struct keychron_device *kdev)
 	}
 
 	if (ret < 0 && attempt == KEYCHRON_QUERY_RETRIES)
-		hid_dbg(kdev->hdev, "battery query failed after %d attempts\n",
-			KEYCHRON_QUERY_RETRIES);
+		hid_dbg(kdev->hdev, "query 0x%02x/0x%02x failed after %d attempts\n",
+			report_id, cmd, KEYCHRON_QUERY_RETRIES);
 
 	kfree(buf);
 	return ret;
+}
+
+static int keychron_query_battery_status(struct keychron_device *kdev)
+{
+	int ret;
+
+	ret = keychron_query(kdev, KEYCHRON_REPORT_ID_CMD, KEYCHRON_CMD_STATUS,
+			     KEYCHRON_REPORT_ID_RESP, KEYCHRON_REPORT_SIZE);
+	if (ret < 0)
+		return ret;
+
+	if (ret < KEYCHRON_BATTERY_OFFSET + 1 ||
+	    (kdev->resp[KEYCHRON_BATTERY_OFFSET] & KEYCHRON_BATTERY_LEVEL) > 100)
+		return -EPROTO;
+
+	return kdev->resp[KEYCHRON_BATTERY_OFFSET];
+}
+
+static bool keychron_update_battery(struct keychron_device *kdev, int battery)
+{
+	int capacity = battery & KEYCHRON_BATTERY_LEVEL;
+	bool charging = !!(battery & KEYCHRON_BATTERY_CHARGING);
+	bool changed = capacity != kdev->battery_capacity ||
+		       charging != kdev->battery_charging;
+
+	kdev->battery_capacity = capacity;
+	kdev->battery_charging = charging;
+
+	return changed;
+}
+
+static int keychron_query_paired_product(struct keychron_device *kdev,
+					 struct hid_device_id *paired_device_id)
+{
+	const u8 *slot;
+	bool connected;
+	u8 i, off;
+	int ret;
+
+	ret = keychron_query(kdev, KEYCHRON_REPORT_ID_INFO,
+			     KEYCHRON_CMD_RECV_STATE, 0,
+			     KEYCHRON_INFO_REPORT_SIZE);
+	if (ret < 0)
+		return ret;
+
+	for (i = 0; i < KEYCHRON_RECV_SLOTS; i++) {
+		off = KEYCHRON_RECV_SLOT_OFFSET + (i * KEYCHRON_RECV_SLOT_SIZE);
+		if (off + KEYCHRON_RECV_SLOT_SIZE > ret)
+			break;
+
+		slot = &kdev->resp[off];
+
+		connected = slot[4] == 1;
+		if (!connected)
+			continue;
+
+		paired_device_id->vendor = get_unaligned_le16(&slot[0]);
+		paired_device_id->product = get_unaligned_le16(&slot[2]);
+
+		return 0;
+	}
+
+	return -ENODEV;
+}
+
+static int keychron_detect_model(struct keychron_device *kdev)
+{
+	struct hid_device_id paired_device_id = { HID_USB_DEVICE(0, 0) };
+	const struct hid_device_id *id;
+	int ret;
+
+	if (kdev->model_name)
+		return 0;
+
+	if (kdev->hdev->product == USB_DEVICE_ID_KEYCHRON_RECV) {
+		ret = keychron_query_paired_product(kdev, &paired_device_id);
+		if (ret) {
+			hid_dbg(kdev->hdev,
+				"failed to query paired mouse: %d\n",
+				ret);
+			return ret;
+		}
+
+		/* fallback, in case we don't find a match */
+		kdev->model_name = "Keychron Ultra-Link 8K";
+
+		for (id = keychron_devices; id->bus; id++) {
+			if (id->bus == paired_device_id.bus &&
+			    id->vendor == paired_device_id.vendor &&
+			    id->product == paired_device_id.product &&
+			    id->driver_data) {
+				kdev->model_name = (const char *)id->driver_data;
+				break;
+			}
+		}
+
+		return 0;
+	}
+
+	id = hid_match_id(kdev->hdev, keychron_devices);
+	if (id)
+		kdev->model_name = (const char *)id->driver_data;
+	else
+		kdev->model_name = "Keychron (Unknown)";
+
+	return 0;
 }
 
 static int keychron_register_battery(struct keychron_device *kdev)
@@ -252,13 +404,17 @@ static int keychron_register_battery(struct keychron_device *kdev)
 	return 0;
 }
 
-static void keychron_battery_work(struct work_struct *work)
+static void keychron_work(struct work_struct *work)
 {
 	struct keychron_device *kdev = container_of(work, struct keychron_device,
-						    battery_work.work);
-	int battery;
+						    work.work);
+	int ret, battery_status;
 
-	battery = keychron_query_battery(kdev);
+	ret = keychron_detect_model(kdev);
+	if (ret)
+		battery_status = ret;
+	else
+		battery_status = keychron_query_battery_status(kdev);
 
 	/*
 	 * The mouse is wireless and frequently asleep (notably at boot), so a
@@ -266,28 +422,30 @@ static void keychron_battery_work(struct work_struct *work)
 	 * interval until it responds rather than giving up — otherwise a single
 	 * miss leaves the battery unreported for the whole session.
 	 */
-	if (battery < 0) {
-		schedule_delayed_work(&kdev->battery_work,
+	if (battery_status < 0) {
+		schedule_delayed_work(&kdev->work,
 				      msecs_to_jiffies(KEYCHRON_RETRY_POLL_MS));
 		return;
 	}
 
 	/* First successful reading: register the power supply now. */
 	if (!kdev->battery) {
+		keychron_update_battery(kdev, battery_status);
 		if (keychron_register_battery(kdev)) {
-			schedule_delayed_work(&kdev->battery_work,
+			schedule_delayed_work(&kdev->work,
 					      msecs_to_jiffies(KEYCHRON_RETRY_POLL_MS));
 			return;
 		}
-		kdev->battery_capacity = battery;
-		hid_info(kdev->hdev, "Keychron mouse battery: %d%%\n", battery);
-	} else if (battery != kdev->battery_capacity) {
-		kdev->battery_capacity = battery;
+		hid_info(kdev->hdev, "%s battery: %d%%%s\n", kdev->model_name,
+			 kdev->battery_capacity,
+			 kdev->battery_charging ? " (charging)" : "");
+	} else if (keychron_update_battery(kdev, battery_status)) {
 		power_supply_changed(kdev->battery);
-		hid_dbg(kdev->hdev, "battery: %d%%\n", battery);
+		hid_dbg(kdev->hdev, "battery: %d%%%s\n", kdev->battery_capacity,
+			kdev->battery_charging ? " (charging)" : "");
 	}
 
-	schedule_delayed_work(&kdev->battery_work,
+	schedule_delayed_work(&kdev->work,
 			      msecs_to_jiffies(KEYCHRON_POLL_INTERVAL_MS));
 }
 
@@ -341,7 +499,6 @@ static int keychron_probe(struct hid_device *hdev,
 	struct keychron_device *kdev;
 	struct usb_interface *intf;
 	int ret;
-	int battery;
 
 	kdev = devm_kzalloc(&hdev->dev, sizeof(*kdev), GFP_KERNEL);
 	if (!kdev)
@@ -410,28 +567,21 @@ static int keychron_probe(struct hid_device *hdev,
 		goto err_cleanup;
 	}
 
-	INIT_DELAYED_WORK(&kdev->battery_work, keychron_battery_work);
+	INIT_DELAYED_WORK(&kdev->work, keychron_work);
 
 	/*
-	 * Try an initial query so the battery shows up immediately when the
-	 * mouse is awake. A failure here is expected for a sleeping wireless
-	 * mouse and must NOT abort battery support: the poll worker keeps
-	 * retrying and registers the power supply on the first reading.
+	 * Try an initial query to see if the mouse is awake. A failure here is
+	 * expected for a sleeping wireless mouse and must NOT abort: the poll
+	 * worker keeps retrying.
 	 */
-	battery = keychron_query_battery(kdev);
-	if (battery >= 0) {
-		ret = keychron_register_battery(kdev);
-		if (ret)
-			goto err_cleanup;
-		kdev->battery_capacity = battery;
-		hid_info(hdev, "Keychron mouse battery: %d%%\n", battery);
-		schedule_delayed_work(&kdev->battery_work,
-				      msecs_to_jiffies(KEYCHRON_POLL_INTERVAL_MS));
-	} else {
-		hid_info(hdev, "battery query failed (%d), mouse likely asleep; will keep polling\n",
-			 battery);
-		schedule_delayed_work(&kdev->battery_work,
+	ret = keychron_detect_model(kdev);
+	if (ret) {
+		hid_info(hdev, "initial query failed (%d), mouse likely asleep; will keep polling\n",
+			 ret);
+		schedule_delayed_work(&kdev->work,
 				      msecs_to_jiffies(KEYCHRON_RETRY_POLL_MS));
+	} else {
+		schedule_delayed_work(&kdev->work, 0);
 	}
 
 	return 0;
@@ -446,7 +596,7 @@ static void keychron_remove(struct hid_device *hdev)
 	struct keychron_device *kdev = hid_get_drvdata(hdev);
 
 	if (kdev && kdev->owns_battery) {
-		cancel_delayed_work_sync(&kdev->battery_work);
+		cancel_delayed_work_sync(&kdev->work);
 		usb_kill_urb(kdev->intr_urb);
 		if (kdev->battery)
 			power_supply_unregister(kdev->battery);
@@ -455,13 +605,6 @@ static void keychron_remove(struct hid_device *hdev)
 
 	hid_hw_stop(hdev);
 }
-
-static const struct hid_device_id keychron_devices[] = {
-	{ HID_USB_DEVICE(USB_VENDOR_ID_KEYCHRON, USB_DEVICE_ID_KEYCHRON_M5) },
-	{ HID_USB_DEVICE(USB_VENDOR_ID_KEYCHRON, USB_DEVICE_ID_KEYCHRON_RECV) },
-	{ }
-};
-MODULE_DEVICE_TABLE(hid, keychron_devices);
 
 static struct hid_driver keychron_driver = {
 	.name = "keychron",
