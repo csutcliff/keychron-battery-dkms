@@ -51,6 +51,7 @@
 
 #define KEYCHRON_POLL_INTERVAL_MS	300000	/* 5 minutes */
 #define KEYCHRON_RETRY_POLL_MS		60000	/* 1 minute, while mouse not yet responding */
+#define KEYCHRON_HANDOFF_DELAY_MS	3000	/* after the owner goes away */
 #define KEYCHRON_USB_TIMEOUT_MS		1000
 #define KEYCHRON_RESPONSE_TIMEOUT_MS	500
 #define KEYCHRON_REPORT_SIZE		64
@@ -58,9 +59,13 @@
 #define KEYCHRON_RETRY_DELAY_MS		100
 
 /*
- * Global state for ensuring only one battery instance exists.
- * Multiple HID interfaces probe for the same physical device.
+ * Only one battery is published system-wide, but the receiver and the mouse
+ * plugged in by cable each bring a vendor interface. Every vendor interface
+ * polls; the owner publishes. A wired mouse takes over from the receiver,
+ * since charging is the usual reason it is plugged in, and when the owner
+ * goes away the remaining devices are polled at once to take over.
  */
+static LIST_HEAD(keychron_list);
 static struct keychron_device *keychron_battery_owner;
 static DEFINE_MUTEX(keychron_battery_mutex);
 
@@ -83,7 +88,9 @@ struct keychron_device {
 	u8 resp[KEYCHRON_REPORT_SIZE];
 	int resp_len;
 	const char *model_name;
-	bool owns_battery;
+	struct list_head node;		/* in keychron_list */
+	bool polling;			/* vendor interface set up */
+	bool wired;
 	atomic_t waiting_response;
 };
 
@@ -404,6 +411,45 @@ static int keychron_register_battery(struct keychron_device *kdev)
 	return 0;
 }
 
+/* Called with keychron_battery_mutex held. */
+static void keychron_release_battery(struct keychron_device *kdev)
+{
+	power_supply_unregister(kdev->battery);
+	kdev->battery = NULL;
+	keychron_battery_owner = NULL;
+}
+
+/* Called with keychron_battery_mutex held. */
+static int keychron_publish(struct keychron_device *kdev, int battery_status)
+{
+	struct keychron_device *owner = keychron_battery_owner;
+
+	if (owner && owner != kdev) {
+		/* Only a wired mouse may take over, and only from a receiver */
+		if (!kdev->wired || owner->wired)
+			return 0;
+		hid_info(kdev->hdev, "wired mouse takes over battery reporting\n");
+		keychron_release_battery(owner);
+	}
+
+	/* First successful reading: register the power supply now. */
+	if (!kdev->battery) {
+		keychron_update_battery(kdev, battery_status);
+		if (keychron_register_battery(kdev))
+			return -EAGAIN;
+		keychron_battery_owner = kdev;
+		hid_info(kdev->hdev, "%s battery: %d%%%s\n", kdev->model_name,
+			 kdev->battery_capacity,
+			 kdev->battery_charging ? " (charging)" : "");
+	} else if (keychron_update_battery(kdev, battery_status)) {
+		power_supply_changed(kdev->battery);
+		hid_dbg(kdev->hdev, "battery: %d%%%s\n", kdev->battery_capacity,
+			kdev->battery_charging ? " (charging)" : "");
+	}
+
+	return 0;
+}
+
 static void keychron_work(struct work_struct *work)
 {
 	struct keychron_device *kdev = container_of(work, struct keychron_device,
@@ -428,25 +474,13 @@ static void keychron_work(struct work_struct *work)
 		return;
 	}
 
-	/* First successful reading: register the power supply now. */
-	if (!kdev->battery) {
-		keychron_update_battery(kdev, battery_status);
-		if (keychron_register_battery(kdev)) {
-			schedule_delayed_work(&kdev->work,
-					      msecs_to_jiffies(KEYCHRON_RETRY_POLL_MS));
-			return;
-		}
-		hid_info(kdev->hdev, "%s battery: %d%%%s\n", kdev->model_name,
-			 kdev->battery_capacity,
-			 kdev->battery_charging ? " (charging)" : "");
-	} else if (keychron_update_battery(kdev, battery_status)) {
-		power_supply_changed(kdev->battery);
-		hid_dbg(kdev->hdev, "battery: %d%%%s\n", kdev->battery_capacity,
-			kdev->battery_charging ? " (charging)" : "");
-	}
+	mutex_lock(&keychron_battery_mutex);
+	ret = keychron_publish(kdev, battery_status);
+	mutex_unlock(&keychron_battery_mutex);
 
 	schedule_delayed_work(&kdev->work,
-			      msecs_to_jiffies(KEYCHRON_POLL_INTERVAL_MS));
+			      msecs_to_jiffies(ret ? KEYCHRON_RETRY_POLL_MS :
+						     KEYCHRON_POLL_INTERVAL_MS));
 }
 
 static bool keychron_is_vendor_interface(struct hid_device *hdev)
@@ -486,11 +520,6 @@ static void keychron_cleanup_battery(struct keychron_device *kdev)
 	kdev->intr_urb = NULL;
 	usb_put_dev(kdev->udev);
 	kdev->udev = NULL;
-
-	mutex_lock(&keychron_battery_mutex);
-	keychron_battery_owner = NULL;
-	kdev->owns_battery = false;
-	mutex_unlock(&keychron_battery_mutex);
 }
 
 static int keychron_probe(struct hid_device *hdev,
@@ -506,7 +535,6 @@ static int keychron_probe(struct hid_device *hdev,
 
 	kdev->hdev = hdev;
 	kdev->battery_capacity = 0;
-	kdev->owns_battery = false;
 	init_completion(&kdev->response_received);
 	atomic_set(&kdev->waiting_response, 0);
 	hid_set_drvdata(hdev, kdev);
@@ -532,14 +560,7 @@ static int keychron_probe(struct hid_device *hdev,
 	if (!keychron_is_vendor_interface(hdev))
 		return 0;
 
-	mutex_lock(&keychron_battery_mutex);
-	if (keychron_battery_owner) {
-		mutex_unlock(&keychron_battery_mutex);
-		return 0;
-	}
-	keychron_battery_owner = kdev;
-	kdev->owns_battery = true;
-	mutex_unlock(&keychron_battery_mutex);
+	kdev->wired = hdev->product != USB_DEVICE_ID_KEYCHRON_RECV;
 
 	/* Get USB device and interface */
 	intf = to_usb_interface(hdev->dev.parent);
@@ -568,6 +589,7 @@ static int keychron_probe(struct hid_device *hdev,
 	}
 
 	INIT_DELAYED_WORK(&kdev->work, keychron_work);
+	kdev->polling = true;
 
 	/*
 	 * Try an initial query to see if the mouse is awake. A failure here is
@@ -584,6 +606,11 @@ static int keychron_probe(struct hid_device *hdev,
 		schedule_delayed_work(&kdev->work, 0);
 	}
 
+	/* Only now, so a takeover kick can't race the query above */
+	mutex_lock(&keychron_battery_mutex);
+	list_add(&kdev->node, &keychron_list);
+	mutex_unlock(&keychron_battery_mutex);
+
 	return 0;
 
 err_cleanup:
@@ -595,11 +622,29 @@ static void keychron_remove(struct hid_device *hdev)
 {
 	struct keychron_device *kdev = hid_get_drvdata(hdev);
 
-	if (kdev && kdev->owns_battery) {
+	struct keychron_device *other;
+
+	if (kdev && kdev->polling) {
+		/* Off the list first so no other device re-queues our work */
+		mutex_lock(&keychron_battery_mutex);
+		list_del(&kdev->node);
+		mutex_unlock(&keychron_battery_mutex);
+
 		cancel_delayed_work_sync(&kdev->work);
 		usb_kill_urb(kdev->intr_urb);
-		if (kdev->battery)
-			power_supply_unregister(kdev->battery);
+
+		mutex_lock(&keychron_battery_mutex);
+		if (keychron_battery_owner == kdev) {
+			keychron_release_battery(kdev);
+			/* Give the mouse time to reconnect to the receiver */
+			list_for_each_entry(other, &keychron_list, node) {
+				cancel_delayed_work(&other->work);
+				schedule_delayed_work(&other->work,
+					msecs_to_jiffies(KEYCHRON_HANDOFF_DELAY_MS));
+			}
+		}
+		mutex_unlock(&keychron_battery_mutex);
+
 		keychron_cleanup_battery(kdev);
 	}
 

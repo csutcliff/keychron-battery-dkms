@@ -68,6 +68,9 @@ Desktop environments with battery widgets (KDE, GNOME, etc.) will automatically 
    command `0x03`, which returns the VID/PID of the paired mouse
 5. Polls every 5 minutes to update battery level
 6. Exposes battery via power_supply subsystem → UPower → desktop widget
+7. With the receiver attached and the mouse plugged in by cable to charge,
+   the wired connection takes over reporting (so charging shows); unplugging
+   hands it back to the receiver within a few seconds
 
 ## Troubleshooting
 
