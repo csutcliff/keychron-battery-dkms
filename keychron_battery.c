@@ -6,8 +6,9 @@
  *
  * This driver queries battery level from Keychron wireless mice via
  * vendor-specific HID commands. It sends a status request on the control
- * endpoint and reads the response from the interrupt endpoint, then
- * exposes the battery level via the power_supply subsystem.
+ * endpoint and takes the response from the HID core's input reports
+ * (raw_event), then exposes the battery level via the power_supply
+ * subsystem.
  *
  * Supported devices:
  *   - Keychron M5 (wired mode): 3434:d048
@@ -27,6 +28,7 @@
 #include <linux/workqueue.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
+#include <linux/minmax.h>
 #include <linux/unaligned.h>
 
 #define USB_VENDOR_ID_KEYCHRON		0x3434
@@ -52,7 +54,6 @@
 #define KEYCHRON_POLL_INTERVAL_MS	300000	/* 5 minutes */
 #define KEYCHRON_RETRY_POLL_MS		60000	/* 1 minute, while mouse not yet responding */
 #define KEYCHRON_HANDOFF_DELAY_MS	3000	/* after the owner goes away */
-#define KEYCHRON_USB_TIMEOUT_MS		1000
 #define KEYCHRON_RESPONSE_TIMEOUT_MS	500
 #define KEYCHRON_REPORT_SIZE		64
 #define KEYCHRON_QUERY_RETRIES		3
@@ -71,16 +72,10 @@ static DEFINE_MUTEX(keychron_battery_mutex);
 
 struct keychron_device {
 	struct hid_device *hdev;
-	struct usb_device *udev;
-	struct usb_interface *intf;
 	struct power_supply *battery;
 	struct power_supply_desc battery_desc;
 	struct delayed_work work;
-	struct urb *intr_urb;
 	struct completion response_received;
-	u8 *intr_buf;
-	int intr_ep;
-	int intr_interval;
 	int battery_capacity;
 	bool battery_charging;
 	u8 expected_cmd;
@@ -90,6 +85,7 @@ struct keychron_device {
 	const char *model_name;
 	struct list_head node;		/* in keychron_list */
 	bool polling;			/* vendor interface set up */
+	bool opened;			/* hid_hw_open() done */
 	bool wired;
 	atomic_t waiting_response;
 };
@@ -161,37 +157,42 @@ static int keychron_battery_get_property(struct power_supply *psy,
 	return 0;
 }
 
-static void keychron_urb_complete(struct urb *urb)
+/*
+ * Responses arrive as ordinary input reports on the vendor interface. Taking
+ * them from the HID core, instead of reading the interrupt endpoint with a
+ * private URB next to usbhid's, keeps one reader on the endpoint. With two,
+ * the receiver's replies could land with the other reader: after a wired
+ * session the private URB only got zero-length reports until the module was
+ * reloaded, while hidraw on the same interface still got the reply.
+ */
+static int keychron_raw_event(struct hid_device *hdev, struct hid_report *report,
+			      u8 *data, int size)
 {
-	struct keychron_device *kdev = urb->context;
-	u8 *data = kdev->intr_buf;
-	int ret;
+	struct keychron_device *kdev = hid_get_drvdata(hdev);
 
-	if (urb->status)
-		return;
-
-	if (!atomic_read(&kdev->waiting_response))
-		return;
+	if (!kdev || !kdev->polling || !atomic_read_acquire(&kdev->waiting_response))
+		return 0;
 
 	/* Validate response: command echo and, if known, the report ID */
-	if (urb->actual_length < 2 || data[1] != kdev->expected_cmd ||
+	if (size < 2 || data[1] != kdev->expected_cmd ||
 	    (kdev->expected_resp_id && data[0] != kdev->expected_resp_id)) {
-		hid_dbg(kdev->hdev,
+		hid_dbg(hdev,
 			"skipping report (expected: cmd=0x%02x, resp_id=0x%02x): %*ph\n",
 			kdev->expected_cmd, kdev->expected_resp_id,
-			urb->actual_length, data);
-
-		ret = usb_submit_urb(urb, GFP_ATOMIC);
-		if (ret)
-			hid_dbg(kdev->hdev, "failed to re-submit URB: %d\n",
-				ret);
-
-		return;
+			min(size, KEYCHRON_REPORT_SIZE), data);
+		return 0;
 	}
 
-	kdev->resp_len = urb->actual_length;
-	memcpy(kdev->resp, data, urb->actual_length);
+	/* Claim the response so only one report completes the query */
+	if (atomic_cmpxchg(&kdev->waiting_response, 1, 0) != 1)
+		return 0;
+
+	kdev->resp_len = min(size, KEYCHRON_REPORT_SIZE);
+	memcpy(kdev->resp, data, kdev->resp_len);
 	complete(&kdev->response_received);
+
+	/* Leave the report to hidraw as well */
+	return 0;
 }
 
 static int keychron_query_once(struct keychron_device *kdev, u8 *buf,
@@ -205,44 +206,31 @@ static int keychron_query_once(struct keychron_device *kdev, u8 *buf,
 	buf[0] = report_id;
 	buf[1] = cmd;
 
-	/* Prepare for interrupt response */
+	/* Prepare for the response */
 	reinit_completion(&kdev->response_received);
 	kdev->expected_cmd = cmd;
 	kdev->expected_resp_id = resp_id;
 	kdev->resp_len = 0;
-	atomic_set(&kdev->waiting_response, 1);
-
-	/* Submit URB to receive interrupt response */
-	usb_fill_int_urb(kdev->intr_urb, kdev->udev,
-			 usb_rcvintpipe(kdev->udev, kdev->intr_ep),
-			 kdev->intr_buf, KEYCHRON_REPORT_SIZE,
-			 keychron_urb_complete, kdev,
-			 kdev->intr_interval);
-
-	ret = usb_submit_urb(kdev->intr_urb, GFP_KERNEL);
-	if (ret < 0)
-		goto out;
+	atomic_set_release(&kdev->waiting_response, 1);
 
 	ret = hid_hw_raw_request(kdev->hdev, report_id, buf, len,
 				 HID_OUTPUT_REPORT, HID_REQ_SET_REPORT);
-	if (ret < 0) {
-		usb_kill_urb(kdev->intr_urb);
+	if (ret < 0)
 		goto out;
-	}
 
-	/* Wait for interrupt response */
 	timeout = wait_for_completion_timeout(&kdev->response_received,
 			msecs_to_jiffies(KEYCHRON_RESPONSE_TIMEOUT_MS));
-
-	usb_kill_urb(kdev->intr_urb);
-
-	if (timeout && kdev->resp_len)
+	if (timeout)
 		return kdev->resp_len;
 
-	return -ETIMEDOUT;
-
+	ret = -ETIMEDOUT;
 out:
-	atomic_set(&kdev->waiting_response, 0);
+	/*
+	 * If raw_event claimed the response in the meantime, let it finish
+	 * writing before the buffer is reused.
+	 */
+	if (atomic_xchg(&kdev->waiting_response, 0) == 0)
+		wait_for_completion(&kdev->response_received);
 	return ret;
 }
 
@@ -253,7 +241,7 @@ static int keychron_query(struct keychron_device *kdev, u8 report_id, u8 cmd,
 	int ret;
 	int attempt;
 
-	if (!kdev->udev || !kdev->intr_urb)
+	if (!kdev->opened)
 		return -ENODEV;
 
 	buf = kmalloc(len, GFP_KERNEL);
@@ -266,7 +254,6 @@ static int keychron_query(struct keychron_device *kdev, u8 report_id, u8 cmd,
 
 		ret = keychron_query_once(kdev, buf, report_id, cmd, resp_id,
 					  len);
-		atomic_set(&kdev->waiting_response, 0);
 
 		if (ret >= 0)
 			break;
@@ -495,38 +482,10 @@ static bool keychron_is_vendor_interface(struct hid_device *hdev)
 	       KEYCHRON_VENDOR_INTERFACE;
 }
 
-static int keychron_find_intr_endpoint(struct usb_interface *intf,
-				       int *ep_addr, int *interval)
-{
-	struct usb_endpoint_descriptor *ep;
-	int i;
-
-	for (i = 0; i < intf->cur_altsetting->desc.bNumEndpoints; i++) {
-		ep = &intf->cur_altsetting->endpoint[i].desc;
-		if (usb_endpoint_is_int_in(ep)) {
-			*ep_addr = ep->bEndpointAddress;
-			*interval = ep->bInterval;
-			return 0;
-		}
-	}
-	return -ENOENT;
-}
-
-static void keychron_cleanup_battery(struct keychron_device *kdev)
-{
-	kfree(kdev->intr_buf);
-	kdev->intr_buf = NULL;
-	usb_free_urb(kdev->intr_urb);
-	kdev->intr_urb = NULL;
-	usb_put_dev(kdev->udev);
-	kdev->udev = NULL;
-}
-
 static int keychron_probe(struct hid_device *hdev,
 			  const struct hid_device_id *id)
 {
 	struct keychron_device *kdev;
-	struct usb_interface *intf;
 	int ret;
 
 	kdev = devm_kzalloc(&hdev->dev, sizeof(*kdev), GFP_KERNEL);
@@ -562,31 +521,17 @@ static int keychron_probe(struct hid_device *hdev,
 
 	kdev->wired = hdev->product != USB_DEVICE_ID_KEYCHRON_RECV;
 
-	/* Get USB device and interface */
-	intf = to_usb_interface(hdev->dev.parent);
-	kdev->intf = intf;
-	kdev->udev = usb_get_dev(interface_to_usbdev(intf));
-
-	/* Find interrupt endpoint */
-	ret = keychron_find_intr_endpoint(intf, &kdev->intr_ep,
-					  &kdev->intr_interval);
+	/*
+	 * Keep usbhid reading the interrupt endpoint even while nobody has
+	 * hidraw open, so responses reach raw_event.
+	 */
+	ret = hid_hw_open(hdev);
 	if (ret) {
-		hid_err(hdev, "no interrupt endpoint found\n");
-		goto err_cleanup;
+		hid_err(hdev, "failed to open device: %d\n", ret);
+		hid_hw_stop(hdev);
+		return ret;
 	}
-
-	/* Allocate URB and buffer */
-	kdev->intr_urb = usb_alloc_urb(0, GFP_KERNEL);
-	if (!kdev->intr_urb) {
-		ret = -ENOMEM;
-		goto err_cleanup;
-	}
-
-	kdev->intr_buf = kmalloc(KEYCHRON_REPORT_SIZE, GFP_KERNEL);
-	if (!kdev->intr_buf) {
-		ret = -ENOMEM;
-		goto err_cleanup;
-	}
+	kdev->opened = true;
 
 	INIT_DELAYED_WORK(&kdev->work, keychron_work);
 	kdev->polling = true;
@@ -612,10 +557,6 @@ static int keychron_probe(struct hid_device *hdev,
 	mutex_unlock(&keychron_battery_mutex);
 
 	return 0;
-
-err_cleanup:
-	keychron_cleanup_battery(kdev);
-	return ret;
 }
 
 static void keychron_remove(struct hid_device *hdev)
@@ -631,7 +572,6 @@ static void keychron_remove(struct hid_device *hdev)
 		mutex_unlock(&keychron_battery_mutex);
 
 		cancel_delayed_work_sync(&kdev->work);
-		usb_kill_urb(kdev->intr_urb);
 
 		mutex_lock(&keychron_battery_mutex);
 		if (keychron_battery_owner == kdev) {
@@ -644,10 +584,10 @@ static void keychron_remove(struct hid_device *hdev)
 			}
 		}
 		mutex_unlock(&keychron_battery_mutex);
-
-		keychron_cleanup_battery(kdev);
 	}
 
+	if (kdev && kdev->opened)
+		hid_hw_close(hdev);
 	hid_hw_stop(hdev);
 }
 
@@ -656,6 +596,7 @@ static struct hid_driver keychron_driver = {
 	.id_table = keychron_devices,
 	.probe = keychron_probe,
 	.remove = keychron_remove,
+	.raw_event = keychron_raw_event,
 };
 module_hid_driver(keychron_driver);
 
