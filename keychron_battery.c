@@ -33,6 +33,7 @@
 #define USB_DEVICE_ID_KEYCHRON_M5	0xd048
 #define USB_DEVICE_ID_KEYCHRON_M6	0xd049
 #define USB_DEVICE_ID_KEYCHRON_RECV	0xd028
+#define USB_DEVICE_ID_KEYCHRON_G4	0xd06d
 
 #define KEYCHRON_REPORT_ID_CMD		0xB3
 #define KEYCHRON_REPORT_ID_RESP		0xB4
@@ -100,6 +101,8 @@ static const struct hid_device_id keychron_devices[] = {
 	  .driver_data = (kernel_ulong_t)"Keychron M5" },
 	{ HID_USB_DEVICE(USB_VENDOR_ID_KEYCHRON, USB_DEVICE_ID_KEYCHRON_M6),
 	  .driver_data = (kernel_ulong_t)"Keychron M6 8K" },
+	{ HID_USB_DEVICE(USB_VENDOR_ID_KEYCHRON, USB_DEVICE_ID_KEYCHRON_G4),
+	  .driver_data = (kernel_ulong_t)"Keychron G4" },
 	{ HID_USB_DEVICE(USB_VENDOR_ID_KEYCHRON, USB_DEVICE_ID_KEYCHRON_RECV) },
 	{ }
 };
